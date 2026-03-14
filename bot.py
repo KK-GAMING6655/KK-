@@ -503,7 +503,7 @@ async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
 
     await interaction.followup.send("Purchase completed.", ephemeral=True)
 
-Main
+main
 async def main():
     await startwebserver()
     token = os.environ.get("DISCORD_TOKEN")
