@@ -1,4 +1,5 @@
 # bot.py 
+# top of bot.py — paste this over the existing bot setup
 import os
 import asyncio
 from aiohttp import web
@@ -8,7 +9,11 @@ from discord.ext import commands
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents (id: {bot.user.id})")
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (id: {bot.user.id})")
 
 # ---------- tiny web server for health checks ----------
 async def handle(request):
