@@ -686,7 +686,7 @@ async def give_coin(interaction: discord.Interaction, user: discord.Member, amou
 
 #Main
 async def main():
-    await startwebserver()
+    await start_web_server()
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set in environment")
