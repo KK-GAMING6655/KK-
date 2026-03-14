@@ -692,7 +692,7 @@ async def main():
         raise RuntimeError("DISCORD_TOKEN not set in environment")
     await bot.start(token)
 
-if name == "main":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
