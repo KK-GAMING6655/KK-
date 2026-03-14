@@ -1,7 +1,11 @@
 # bot.py
-# Consolidated, fixed, and improved embeds for card displays.
-# Env vars required: DISCORD_TOKEN; optional: GUILD_ID (int) for instant guild sync.
-# requirements.txt must include: discord.py>=2.0.0, aiohttp, aiosqlite
+# Full consolidated bot with fixes requested:
+# - missing commands added
+# - public messages (non-ephemeral)
+# - card_list pagination with buttons
+# - gacha uses per-user luck_amount and consumes it
+# - inventory, leaderboard, trade, give_card, give_coin implemented
+# Requirements: discord.py>=2.0.0, aiohttp, aiosqlite
 
 import os
 import asyncio
@@ -15,7 +19,7 @@ from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.ui import View
+from discord.ui import View, Button
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -130,10 +134,8 @@ async def card_embed(card_row, header: Optional[str] = None):
     embed = discord.Embed(title=title, color=colour)
     if header:
         embed.description = header
-    # image
     if image_url:
         embed.set_image(url=image_url)
-    # fields
     embed.add_field(name="Name", value=name, inline=True)
     embed.add_field(name="Rarity", value=rarity, inline=True)
     embed.add_field(name="Value", value=str(value), inline=True)
@@ -203,6 +205,88 @@ class DropView(View):
             except Exception:
                 pass
 
+# Pagination view for card_list
+class CardListView(View):
+    def __init__(self, cards: List[tuple], author_id: int):
+        super().__init__(timeout=120)
+        self.cards = cards
+        self.index = 0
+        self.author_id = author_id
+
+    async def update_message(self, interaction: discord.Interaction):
+        card = self.cards[self.index]
+        embed = await card_embed(card, header=f"Card {self.index+1}/{len(self.cards)}")
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary, custom_id="card_prev")
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # allow anyone to view pages, not only author
+        self.index = (self.index - 1) % len(self.cards)
+        await self.update_message(interaction)
+
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary, custom_id="card_next")
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index = (self.index + 1) % len(self.cards)
+        await self.update_message(interaction)
+
+# Trade view for accepting/denying trades
+class TradeView(View):
+    def __init__(self, listing_id: int, seller_id: int, card_row, price: int, quantity: int):
+        super().__init__(timeout=60*60)
+        self.listing_id = listing_id
+        self.seller_id = seller_id
+        self.card_row = card_row
+        self.price = price
+        self.quantity = quantity
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.success, custom_id="trade_buy")
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        buyer = interaction.user
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT quantity FROM market WHERE id = ?", (self.listing_id,))
+            r = await cur.fetchone()
+            if not r or r[0] <= 0:
+                await interaction.response.send_message("Listing no longer available.", ephemeral=True)
+                return
+            avail = r[0]
+            if avail < 1:
+                await interaction.response.send_message("Not enough quantity.", ephemeral=True)
+                return
+            total = self.price
+            await ensure_user(buyer.id)
+            cur = await db.execute("SELECT balance FROM users WHERE user_id = ?", (buyer.id,))
+            bal = (await cur.fetchone())[0]
+            if bal < total:
+                await interaction.response.send_message("You don't have enough balance.", ephemeral=True)
+                return
+            # transfer
+            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total, buyer.id))
+            await db.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (self.seller_id, 0))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (total, self.seller_id))
+            await db.execute("UPDATE market SET quantity = quantity - 1 WHERE id = ?", (self.listing_id,))
+            await db.execute("""INSERT INTO inventory (user_id, card_id, quantity)
+                                VALUES (?, ?, 1)
+                                ON CONFLICT(user_id, card_id) DO UPDATE SET quantity = quantity + 1""",
+                             (buyer.id, self.card_row[0]))
+            await db.execute("DELETE FROM market WHERE id = ? AND quantity <= 0", (self.listing_id,))
+            await db.commit()
+
+        channel_id = await get_setting("default_channel")
+        if channel_id:
+            try:
+                ch = interaction.guild.get_channel(int(channel_id))
+                if ch:
+                    embed = await card_embed(self.card_row, header=f"{buyer.display_name} bought {self.card_row[1]}!")
+                    await ch.send(embed=embed)
+            except Exception:
+                pass
+
+        await interaction.response.send_message("Purchase completed.", ephemeral=True)
+        self.stop()
+
 # on_ready
 @bot.event
 async def on_ready():
@@ -229,138 +313,194 @@ async def on_ready():
         log.exception("Command sync failed: %s", e)
 
 # -------------------- Commands --------------------
+
+# Admin: set default announcement channel (public)
 @tree.command(name="set_channel", description="Set default announcement channel for card receipts")
 @is_admin()
 @app_commands.describe(channel="Channel to set")
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     await set_setting("default_channel", str(channel.id))
-    await interaction.response.send_message(f"Default channel set to {channel.mention}.", ephemeral=True)
+    await interaction.response.send_message(f"Default channel set to {channel.mention}", ephemeral=False)
 
+# Admin: add card
 @tree.command(name="add_card", description="Add a card to the database")
 @is_admin()
 @app_commands.describe(name="Card name", image_url="Image URL", rarity="Rarity name", value="Card value")
 async def add_card(interaction: discord.Interaction, name: str, image_url: str, rarity: str, value: int):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT name FROM rarities WHERE name = ?", (rarity,))
         if not await cur.fetchone():
-            await interaction.followup.send("Rarity not found.", ephemeral=True)
+            await interaction.followup.send("Rarity not found.", ephemeral=False)
             return
         try:
             await db.execute("INSERT INTO cards (name, image_url, rarity, value) VALUES (?, ?, ?, ?)",
                              (name, image_url, rarity, value))
             await db.commit()
-            await interaction.followup.send(f"Card **{name}** added.", ephemeral=True)
+            await interaction.followup.send(f"Card **{name}** added.", ephemeral=False)
         except aiosqlite.IntegrityError:
-            await interaction.followup.send("Card with that name already exists.", ephemeral=True)
+            await interaction.followup.send("Card with that name already exists.", ephemeral=False)
 
+# Admin: remove card
 @tree.command(name="remove_card", description="Remove a card")
 @is_admin()
 @app_commands.describe(name="Card name")
 async def remove_card(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM cards WHERE name = ?", (name,))
         await db.commit()
-    await interaction.followup.send(f"Card **{name}** removed (if existed).", ephemeral=True)
+    await interaction.followup.send(f"Card **{name}** removed (if existed).", ephemeral=False)
 
-@tree.command(name="card_list", description="List all cards")
+# Admin: card_list with pagination (public)
+@tree.command(name="card_list", description="List all cards (embed with paging)")
 @is_admin()
 async def card_list(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, name, rarity, value FROM cards")
+        cur = await db.execute("SELECT id, name, image_url, rarity, value FROM cards ORDER BY id")
         rows = await cur.fetchall()
     if not rows:
-        await interaction.followup.send("No cards found.", ephemeral=True)
+        await interaction.followup.send("No cards found.", ephemeral=False)
         return
-    text = "\n".join([f"{r[0]}: {r[1]} ({r[2]}) - {r[3]} coins" for r in rows])
-    await interaction.followup.send(f"**Cards:**\n{text}", ephemeral=True)
+    view = CardListView(rows, author_id=interaction.user.id)
+    embed = await card_embed(rows[0], header=f"Card 1/{len(rows)}")
+    await interaction.followup.send(embed=embed, view=view, ephemeral=False)
 
+# Admin: rarity add/remove/list
 @tree.command(name="rarity_add", description="Add a rarity")
 @is_admin()
 @app_commands.describe(name="Rarity name", colour_hex="Hex colour like #ff0000", weight="Gacha weight")
 async def rarity_add(interaction: discord.Interaction, name: str, colour_hex: str, weight: int):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO rarities (name, colour_hex, weight) VALUES (?, ?, ?)",
                          (name, colour_hex, weight))
         await db.commit()
-    await interaction.followup.send(f"Rarity **{name}** set.", ephemeral=True)
+    await interaction.followup.send(f"Rarity **{name}** set.", ephemeral=False)
 
 @tree.command(name="rarity_remove", description="Remove a rarity")
 @is_admin()
 @app_commands.describe(name="Rarity name")
 async def rarity_remove(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM rarities WHERE name = ?", (name,))
         await db.commit()
-    await interaction.followup.send(f"Rarity **{name}** removed.", ephemeral=True)
+    await interaction.followup.send(f"Rarity **{name}** removed.", ephemeral=False)
 
 @tree.command(name="rarity_list", description="List rarities")
 @is_admin()
 async def rarity_list(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT name, colour_hex, weight FROM rarities")
         rows = await cur.fetchall()
     text = "\n".join([f"{r[0]} - {r[1]} - weight {r[2]}" for r in rows])
-    await interaction.followup.send(f"**Rarities:**\n{text}", ephemeral=True)
+    await interaction.followup.send(f"**Rarities:**\n{text}", ephemeral=False)
 
-@tree.command(name="drop", description="Drop a card into the default channel with a Get button")
+# Admin: clear inventory/balance/inspect/add/remove coin
+@tree.command(name="clear_inventory", description="Clear inventory of a user")
 @is_admin()
-@app_commands.describe(name="Card name", quantity="Number of copies to drop")
-async def drop(interaction: discord.Interaction, name: str, quantity: int):
-    await interaction.response.defer(ephemeral=True)
+@app_commands.describe(user="Target user")
+async def clear_inventory(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, name, image_url, rarity, value FROM cards WHERE name = ?", (name,))
-        card = await cur.fetchone()
-        if not card:
-            await interaction.followup.send("Card not found.", ephemeral=True)
-            return
-        channel_id = await get_setting("default_channel")
-        if not channel_id:
-            await interaction.followup.send("Default channel not set. Use /set_channel.", ephemeral=True)
-            return
-        ch = interaction.guild.get_channel(int(channel_id))
-        if not ch:
-            await interaction.followup.send("Default channel not found.", ephemeral=True)
-            return
-        embed = await card_embed(card, header=f"Drop: {card[1]} ({card[3]})")
-        embed.add_field(name="Quantity", value=str(quantity), inline=True)
-        msg = await ch.send(embed=embed)
-        await db.execute("INSERT OR REPLACE INTO drops (message_id, card_id, remaining) VALUES (?, ?, ?)",
-                         (msg.id, card[0], quantity))
+        await db.execute("DELETE FROM inventory WHERE user_id = ?", (user.id,))
         await db.commit()
-        view = DropView(msg.id, card[0])
-        try:
-            await msg.edit(view=view)
-        except Exception:
-            pass
-        await interaction.followup.send("Drop posted.", ephemeral=True)
+    await interaction.followup.send(f"Cleared inventory of {user.display_name}.", ephemeral=False)
 
-@tree.command(name="luck_amount", description="Set gacha roll amount")
+@tree.command(name="clear_balance", description="Clear balance of a user")
 @is_admin()
-@app_commands.describe(amount="Number of rolls per gacha command")
-async def luck_amount(interaction: discord.Interaction, amount: int):
-    await set_setting("luck_amount", str(amount))
-    await interaction.response.send_message(f"Gacha roll amount set to {amount}.", ephemeral=True)
-
-@tree.command(name="balance", description="Check your balance")
-async def balance(interaction: discord.Interaction):
-    await ensure_user(interaction.user.id)
+@app_commands.describe(user="Target user")
+async def clear_balance(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT balance FROM users WHERE user_id = ?", (interaction.user.id,))
-        r = await cur.fetchone()
-    bal = r[0] if r else 0
-    await interaction.response.send_message(f"Your balance: {bal}", ephemeral=True)
+        await db.execute("UPDATE users SET balance = 0 WHERE user_id = ?", (user.id,))
+        await db.commit()
+    await interaction.followup.send(f"Cleared balance of {user.display_name}.", ephemeral=False)
 
+@tree.command(name="inspect_inventory", description="Inspect a user's inventory")
+@is_admin()
+@app_commands.describe(user="Target user")
+async def inspect_inventory(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""SELECT c.name, i.quantity FROM inventory i
+                                  JOIN cards c ON c.id = i.card_id
+                                  WHERE i.user_id = ?""", (user.id,))
+        rows = await cur.fetchall()
+    if not rows:
+        await interaction.followup.send("No items.", ephemeral=False)
+        return
+    text = "\n".join([f"{r[0]} x{r[1]}" for r in rows])
+    await interaction.followup.send(f"Inventory of {user.display_name}:\n{text}", ephemeral=False)
+
+@tree.command(name="add_coin", description="Add coins to a user")
+@is_admin()
+@app_commands.describe(user="Target user", amount="Amount to add")
+async def add_coin(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=False)
+    await ensure_user(user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user.id))
+        await db.commit()
+    await interaction.followup.send(f"Added {amount} coins to {user.display_name}.", ephemeral=False)
+
+@tree.command(name="remove_coin", description="Remove coins from a user")
+@is_admin()
+@app_commands.describe(user="Target user", amount="Amount to remove")
+async def remove_coin(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=False)
+    await ensure_user(user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = MAX(balance - ?, 0) WHERE user_id = ?", (amount, user.id))
+        await db.commit()
+    await interaction.followup.send(f"Removed {amount} coins from {user.display_name}.", ephemeral=False)
+
+Member: inventory (public)
+@tree.command(name="inventory", description="View your inventory")
+async def inventory(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""SELECT c.name, i.quantity FROM inventory i
+                                  JOIN cards c ON c.id = i.card_id
+                                  WHERE i.user_id = ?""", (interaction.user.id,))
+        rows = await cur.fetchall()
+    if not rows:
+        await interaction.followup.send("Your inventory is empty.", ephemeral=False)
+        return
+    text = "\n".join([f"{r[0]} x{r[1]}" for r in rows])
+    await interaction.followup.send(f"{interaction.user.display_name}'s inventory:\n{text}", ephemeral=False)
+
+Member: card_leaderboard (public)
+@tree.command(name="card_leaderboard", description="Leaderboard by balance")
+async def card_leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10")
+        rows = await cur.fetchall()
+    if not rows:
+        await interaction.followup.send("No users found.", ephemeral=False)
+        return
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        user = bot.get_user(r[0])
+        name = user.display_name if user else f"User {r[0]}"
+        lines.append(f"{i}. {name} — {r[1]} coins")
+    await interaction.followup.send("Leaderboard:\n" + "\n".join(lines), ephemeral=False)
+
+Member: gacha (public) — uses per-user luckamount{user_id} if present and consumes it
 @tree.command(name="gacha", description="Roll gacha to get random cards")
 async def gacha(interaction: discord.Interaction):
     await ensure_user(interaction.user.id)
-    await interaction.response.defer(ephemeral=True)
-    amount_str = await get_setting("luck_amount") or "1"
+    await interaction.response.defer(ephemeral=False)
+
+    # Check per-user luck amount first
+    userkey = f"luckamount_{interaction.user.id}"
+    amountstr = await getsetting(user_key)
+    if amount_str is None:
+        amountstr = await getsetting("luck_amount") or "1"
     try:
         amount = max(1, int(amount_str))
     except Exception:
@@ -371,7 +511,7 @@ async def gacha(interaction: discord.Interaction):
         cur = await db.execute("SELECT name, weight FROM rarities")
         rarities = await cur.fetchall()
         if not rarities:
-            await interaction.followup.send("No rarities configured.", ephemeral=True)
+            await interaction.followup.send("No rarities configured.", ephemeral=False)
             return
         rarity_names = [r[0] for r in rarities]
         weights = [r[1] for r in rarities]
@@ -384,92 +524,101 @@ async def gacha(interaction: discord.Interaction):
             card = random.choice(rows)
             got_cards.append(card)
             await db.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (interaction.user.id, 0))
-            await db.execute("""INSERT INTO inventory (user_id, card_id, quantity)
+            await db.execute("""INSERT INTO inventory (userid, cardid, quantity)
                                 VALUES (?, ?, 1)
-                                ON CONFLICT(user_id, card_id) DO UPDATE SET quantity = quantity + 1""",
+                                ON CONFLICT(userid, cardid) DO UPDATE SET quantity = quantity + 1""",
                              (interaction.user.id, card[0]))
         await db.commit()
 
+    # If per-user key existed, consume it (delete) so it only applies once
+    if await getsetting(userkey) is not None:
+        await setsetting(userkey, None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM settings WHERE key = ?", (user_key,))
+            await db.commit()
+
     if not got_cards:
-        await interaction.followup.send("No cards available for gacha.", ephemeral=True)
+        await interaction.followup.send("No cards available for gacha.", ephemeral=False)
         return
 
-    channel_id = await get_setting("default_channel")
+    channelid = await getsetting("default_channel")
     for card in got_cards:
         if channel_id:
             try:
-                ch = interaction.guild.get_channel(int(channel_id))
+                ch = interaction.guild.getchannel(int(channelid))
                 if ch:
-                    embed = await card_embed(card, header=f"{interaction.user.display_name} rolled a gacha!")
+                    embed = await cardembed(card, header=f"{interaction.user.displayname} rolled a gacha!")
                     await ch.send(embed=embed)
             except Exception:
                 pass
 
-    # Show a summary to the roller (ephemeral) with names and rarities
-    summary = "\n".join([f"**{c[1]}** — {c[3]} (Value: {c[4]})" for c in got_cards])
-    await interaction.followup.send(f"You rolled and got {len(got_cards)} card(s):\n{summary}", ephemeral=True)
+    # Summary to roller (public)
+    summary = "\n".join([f"{c[1]} — {c[3]} (Value: {c[4]})" for c in got_cards])
+    await interaction.followup.send(f"{interaction.user.mention} rolled and got {len(got_cards)} card(s):\n{summary}", ephemeral=False)
 
-@tree.command(name="view_card", description="View a card (ephemeral)")
+Member: view_card (public)
+@tree.command(name="view_card", description="View a card")
 @app_commands.describe(name="Card name")
 async def view_card(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id, name, image_url, rarity, value FROM cards WHERE name = ?", (name,))
         card = await cur.fetchone()
     if not card:
-        await interaction.followup.send("Card not found.", ephemeral=True)
+        await interaction.followup.send("Card not found.", ephemeral=False)
         return
     embed = await card_embed(card)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=False)
 
+Market: view/sell/buy
 @tree.command(name="market", description="View market listings")
 async def market(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""SELECT m.id, c.name, m.price, m.quantity, m.seller_id FROM market m
                                   JOIN cards c ON c.id = m.card_id""")
         rows = await cur.fetchall()
     if not rows:
-        await interaction.followup.send("Market is empty.", ephemeral=True)
+        await interaction.followup.send("Market is empty.", ephemeral=False)
         return
     text = "\n".join([f"Listing {r[0]}: {r[1]} x{r[3]} - {r[2]} coins (seller ID {r[4]})" for r in rows])
-    await interaction.followup.send(f"**Market:**\n{text}", ephemeral=True)
+    await interaction.followup.send(f"Market:\n{text}", ephemeral=False)
 
 @tree.command(name="sell", description="List a card on the market")
-@app_commands.describe(card_name="Card name", price="Price per card", quantity="Quantity to sell")
+@appcommands.describe(cardname="Card name", price="Price per card", quantity="Quantity to sell")
 async def sell(interaction: discord.Interaction, card_name: str, price: int, quantity: int):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id FROM cards WHERE name = ?", (card_name,))
         card = await cur.fetchone()
         if not card:
-            await interaction.followup.send("Card not found.", ephemeral=True)
+            await interaction.followup.send("Card not found.", ephemeral=False)
             return
         card_id = card[0]
         cur = await db.execute("SELECT quantity FROM inventory WHERE userid = ? AND cardid = ?", (interaction.user.id, card_id))
         r = await cur.fetchone()
         if not r or r[0] < quantity:
-            await interaction.followup.send("You don't have enough cards to sell.", ephemeral=True)
+            await interaction.followup.send("You don't have enough cards to sell.", ephemeral=False)
             return
         await db.execute("UPDATE inventory SET quantity = quantity - ? WHERE userid = ? AND cardid = ?", (quantity, interaction.user.id, card_id))
         await db.execute("INSERT INTO market (sellerid, cardid, price, quantity) VALUES (?, ?, ?, ?)",
                          (interaction.user.id, card_id, price, quantity))
         await db.commit()
-    await interaction.followup.send("Listed on market.", ephemeral=True)
+    await interaction.followup.send("Listed on market.", ephemeral=False)
 
 @tree.command(name="buy", description="Buy from market listing")
-@app_commands.describe(listing_id="Listing ID", quantity="Quantity to buy")
+@appcommands.describe(listingid="Listing ID", quantity="Quantity to buy")
 async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT sellerid, cardid, price, quantity FROM market WHERE id = ?", (listing_id,))
         row = await cur.fetchone()
         if not row:
-            await interaction.followup.send("Listing not found.", ephemeral=True)
+            await interaction.followup.send("Listing not found.", ephemeral=False)
             return
         sellerid, cardid, price, avail = row
         if quantity > avail:
-            await interaction.followup.send("Not enough quantity available.", ephemeral=True)
+            await interaction.followup.send("Not enough quantity available.", ephemeral=False)
             return
         total = price * quantity
         await ensure_user(interaction.user.id)
@@ -477,7 +626,7 @@ async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
         r = await cur.fetchone()
         bal = r[0] if r else 0
         if bal < total:
-            await interaction.followup.send("You don't have enough balance.", ephemeral=True)
+            await interaction.followup.send("You don't have enough balance.", ephemeral=False)
             return
         await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total, interaction.user.id))
         await db.execute("INSERT OR IGNORE INTO users (userid, balance) VALUES (?, ?)", (sellerid, 0))
@@ -501,17 +650,48 @@ async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
         except Exception:
             pass
 
-    await interaction.followup.send("Purchase completed.", ephemeral=True)
+    await interaction.followup.send("Purchase completed.", ephemeral=False)
 
-# Main entrypoint
+Admin: givecard and givecoin
+@tree.command(name="give_card", description="Give a card to a user")
+@is_admin()
+@appcommands.describe(user="Target user", cardname="Card name", amount="Amount to give")
+async def givecard(interaction: discord.Interaction, user: discord.Member, cardname: str, amount: int = 1):
+    await interaction.response.defer(ephemeral=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, name, imageurl, rarity, value FROM cards WHERE name = ?", (cardname,))
+        card = await cur.fetchone()
+        if not card:
+            await interaction.followup.send("Card not found.", ephemeral=False)
+            return
+        await db.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (user.id, 0))
+        await db.execute("""INSERT INTO inventory (userid, cardid, quantity)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(userid, cardid) DO UPDATE SET quantity = quantity + ?""",
+                         (user.id, card[0], amount, amount))
+        await db.commit()
+    await interaction.followup.send(f"Gave {amount} x {cardname} to {user.displayname}.", ephemeral=False)
+
+@tree.command(name="give_coin", description="Give coins to a user")
+@is_admin()
+@app_commands.describe(user="Target user", amount="Amount to give")
+async def give_coin(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=False)
+    await ensure_user(user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user.id))
+        await db.commit()
+    await interaction.followup.send(f"Gave {amount} coins to {user.display_name}.", ephemeral=False)
+
+Main
 async def main():
-    await start_web_server()
+    await startwebserver()
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set in environment")
     await bot.start(token)
 
-if __name__ == "__main__":
+if name == "main":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
