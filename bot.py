@@ -652,11 +652,12 @@ async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
 
     await interaction.followup.send("Purchase completed.", ephemeral=False)
 
-Admin: givecard and givecoin
+#Admin: givecard and givecoin
+
 @tree.command(name="give_card", description="Give a card to a user")
 @is_admin()
 @app_commands.describe(user="Target user", card_name="Card name", amount="Amount to give")
-async def givecard(interaction: discord.Interaction, user: discord.Member, cardname: str, amount: int = 1):
+async def give_card(interaction: discord.Interaction, user: discord.Member, card_name: str, amount: int = 1):
     await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id, name, imageurl, rarity, value FROM cards WHERE name = ?", (cardname,))
