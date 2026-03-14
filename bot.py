@@ -1,15 +1,16 @@
-# bot.py
+# bot.py 
 import os
-import random
-import aiosqlite
 import asyncio
-from typing import Optional
+from aiohttp import web
 import discord
-from discord import app_commands
 from discord.ext import commands
-from discord.ui import View, Button
 
-# --- tiny web server for Render health checks ---
+# ---------- Bot setup ----------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents} (id: {bot.user.id})")
+
+# ---------- tiny web server for health checks ----------
 async def handle(request):
     return web.Response(text="OK")
 
@@ -21,13 +22,11 @@ async def start_web_server():
     port = int(os.environ.get("PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"Health server running on port {port}")
 
-# --- start both web server and discord bot ---
+# ---------- main: start web server and bot in same loop ----------
 async def main():
-    # start web server first so Render health checks pass
     await start_web_server()
-
-    # start your discord bot (replace `bot` with your Bot/Client variable)
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set in environment")
@@ -38,11 +37,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
-
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # optional for testing
 
 ADMIN_PERMS = discord.Permissions(administrator=True)
 
