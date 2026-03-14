@@ -490,7 +490,7 @@ async def card_leaderboard(interaction: discord.Interaction):
         lines.append(f"{i}. {name} — {r[1]} coins")
     await interaction.followup.send("Leaderboard:\n" + "\n".join(lines), ephemeral=False)
 
-Member: gacha (public) — uses per-user luckamount{user_id} if present and consumes it
+#Member: gacha (public) — uses per-user luckamount{user_id} if present and consumes it
 @tree.command(name="gacha", description="Roll gacha to get random cards")
 async def gacha(interaction: discord.Interaction):
     await ensure_user(interaction.user.id)
