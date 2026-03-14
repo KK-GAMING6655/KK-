@@ -684,7 +684,7 @@ async def give_coin(interaction: discord.Interaction, user: discord.Member, amou
         await db.commit()
     await interaction.followup.send(f"Gave {amount} coins to {user.display_name}.", ephemeral=False)
 
-Main
+#Main
 async def main():
     await startwebserver()
     token = os.environ.get("DISCORD_TOKEN")
