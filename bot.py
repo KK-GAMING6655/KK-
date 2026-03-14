@@ -458,7 +458,7 @@ async def sell(interaction: discord.Interaction, card_name: str, price: int, qua
     await interaction.followup.send("Listed on market.", ephemeral=True)
 
 @tree.command(name="buy", description="Buy from market listing")
-@app_commands.describe(listingid="Listing ID", quantity="Quantity to buy")
+@app_commands.describe(listing_id="Listing ID", quantity="Quantity to buy")
 async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
     await interaction.response.defer(ephemeral=True)
     async with aiosqlite.connect(DB_PATH) as db:
