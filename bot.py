@@ -503,15 +503,15 @@ async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
 
     await interaction.followup.send("Purchase completed.", ephemeral=True)
 
-#main
+# Main entrypoint
 async def main():
-    await startwebserver()
+    await start_web_server()
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set in environment")
     await bot.start(token)
 
-if name == "main":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
