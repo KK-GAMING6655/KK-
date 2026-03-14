@@ -585,7 +585,7 @@ async def market(interaction: discord.Interaction):
     await interaction.followup.send(f"Market:\n{text}", ephemeral=False)
 
 @tree.command(name="sell", description="List a card on the market")
-@app_commands.describe(cardname="Card name", price="Price per card", quantity="Quantity to sell")
+@app_commands.describe(card_name="Card name", price="Price per card", quantity="Quantity to sell")
 async def sell(interaction: discord.Interaction, card_name: str, price: int, quantity: int):
     await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -655,7 +655,7 @@ async def buy(interaction: discord.Interaction, listing_id: int, quantity: int):
 Admin: givecard and givecoin
 @tree.command(name="give_card", description="Give a card to a user")
 @is_admin()
-@app_commands.describe(user="Target user", cardname="Card name", amount="Amount to give")
+@app_commands.describe(user="Target user", card_name="Card name", amount="Amount to give")
 async def givecard(interaction: discord.Interaction, user: discord.Member, cardname: str, amount: int = 1):
     await interaction.response.defer(ephemeral=False)
     async with aiosqlite.connect(DB_PATH) as db:
